@@ -1,14 +1,17 @@
 # Zigbee Energy Manager
 
-An asynchronous Zigbee network manager for monitoring and controlling Zigbee devices with a focus on energy telemetry, device state tracking, and event-driven processing.
+An asynchronous Zigbee network manager for monitoring and controlling Zigbee devices with a focus on energy telemetry, device state tracking, and event-driven processing. Zigbee Energy Manager is an event-driven system for managing a Zigbee network. It provides:
+
+* Device control (switching smart plugs)
+* Energy telemetry collection (voltage, current, power, energy)
+* Sensor monitoring (motion, contact, smoke)
+* Persistent logging to log file and CSV
+* Inter-process communication via FIFO
 
 Built on top of `zigpy` and `bellows`, designed for use with a Zigbee coordinator (Silicon Labs EZSP -- JetStick Z4) on Linux systems such as Raspberry Pi.
 
----
-
 ## Table of Contents
 
-* [Overview](#overview)
 * [Zigbee Architecture](#zigbee-architecture)
 * [Supported Devices](#supported-devices)
 * [Features](#features)
@@ -22,15 +25,6 @@ Built on top of `zigpy` and `bellows`, designed for use with a Zigbee coordinato
 * [Troubleshooting](#troubleshooting)
 * [Testing Setup (~/.bashrc)](#testing-setup-bashrc)
 
-## Overview
-
-Zigbee Energy Manager is an event-driven system for managing a Zigbee network. It provides:
-
-* Device control (e.g., switching smart plugs)
-* Energy telemetry collection (voltage, current, power, energy)
-* Sensor monitoring (motion, contact, smoke)
-* Persistent logging to CSV
-* Inter-process communication via FIFO
 
 ## Zigbee Architecture
 
@@ -70,8 +64,6 @@ Clusters:
 * PowerConfiguration
 * TemperatureMeasurement
 * RelativeHumidity
-
----
 
 ## Features
 
@@ -153,7 +145,7 @@ Make sure the device path points to your Zigbee coordinator.
 ## Running
 
 ```bash
-python zigbee_manager.py
+LOG_LEVEL=INFO python zigbee_manager.py
 ```
 
 On startup:
@@ -202,22 +194,121 @@ All data is stored under:
 measurements/YYYY-MM-DD/
 ```
 
-### smart_plug.csv
-
-* voltage
-* current
-* power
-* energy
-
-### temperature.csv / humidity.csv
-
-* sensor measurements
-
-### binary_sensors.csv
-
-* IAS Zone events (motion, smoke, contact)
+Below is the same detailed description in English, aligned precisely with your script implementation.
 
 ---
+
+## smart_plug.csv
+
+Logged in `_background_mains_monitor()` approximately every 60 seconds for mains-powered devices.
+
+| Column       | Type   | Unit     | Source/ZCL                     | Description                              |
+| ------------ | ------ | -------- | ------------------------------ | ---------------------------------------- |
+| timestamp    | string | ISO 8601 | System                         | Timestamp (`datetime.now().isoformat()`) |
+| ieee         | string | —        | Device                         | Device IEEE address                      |
+| manufacturer | string | —        | Basic cluster                  | Device manufacturer                      |
+| model        | string | —        | Basic cluster                  | Device model                             |
+| state        | string | ON/OFF   | OnOff (0x0006)                 | Current plug state                       |
+| voltage      | float  | V        | ElectricalMeasurement          | RMS voltage                              |
+| current      | float  | A        | ElectricalMeasurement          | RMS current                              |
+| power        | float  | W        | ElectricalMeasurement          | Active power                             |
+| energy_kwh   | float  | kWh      | Metering (0x0702)              | Accumulated energy                       |
+
+### Notes:
+
+* Values are scaled using:
+
+  * `multiplier`
+  * `divisor`
+* If a cluster is not available, the field may be missing (`None`)
+* `energy_kwh` is derived from `current_summ_delivered`
+
+---
+
+## temperature.csv
+
+Logged in `attribute_updated()` on attribute change events.
+
+| Column        | Type   | Unit     | Source (Zigbee)                 | Description       |
+| ------------- | ------ | -------- | ------------------------------- | ----------------- |
+| timestamp     | string | ISO 8601 | System                          | Event timestamp   |
+| ieee          | string | —        | Device                          | Device IEEE       |
+| model         | string | —        | Device                          | Device model      |
+| temperature_c | float  | °C       | TemperatureMeasurement (0x0402) | Temperature value |
+
+### Notes:
+
+* Raw value conversion:
+
+  * `temperature = value / 100`
+* Event-driven (no polling)
+
+---
+
+## humidity.csv
+
+Same mechanism as temperature.
+
+| Column           | Type   | Unit     | Source (Zigbee)           | Description     |
+| ---------------- | ------ | -------- | ------------------------- | --------------- |
+| timestamp        | string | ISO 8601 | System                    | Event timestamp |
+| ieee             | string | —        | Device                    | Device IEEE     |
+| model            | string | —        | Device                    | Device model    |
+| humidity_percent | float  | %        | RelativeHumidity (0x0405) | Humidity value  |
+
+### Notes:
+* Conversion:
+  * `humidity = value / 100`
+* Typically uses Zigbee reporting
+
+## binary_sensors.csv
+
+Logged in `IASZoneListener.cluster_command()`.
+
+| Column       | Type   | Unit     | Source (Zigbee)             | Description            |
+| ------------ | ------ | -------- | --------------------------- | ---------------------- |
+| timestamp    | string | ISO 8601 | System                      | Event timestamp        |
+| ieee         | string | —        | Device                      | Device IEEE            |
+| manufacturer | string | —        | Basic cluster               | Manufacturer           |
+| model        | string | —        | Basic cluster               | Model                  |
+| sensor_type  | string | —        | Derived                     | Sensor classification  |
+| state        | int    | 0/1      | IAS Zone (0x0500)           | Triggered state        |
+| tamper       | int    | 0/1      | IAS Zone                    | Tamper flag            |
+| battery      | int/"" | %        | PowerConfiguration (0x0001) | Battery level          |
+| lqi          | int/"" | —        | Device                      | Link Quality Indicator |
+
+---
+
+### Sensor Type Logic
+
+| Condition (model string)     | Type    |
+| ---------------------------- | ------- |
+| contains "PIR" or "Motion"   | motion  |
+| contains "Smoke" or "TS0205" | smoke   |
+| otherwise                    | contact |
+
+
+### IAS Zone Bit-Level Mapping
+
+| Bit   | Meaning         |
+| ----- | --------------- |
+| bit 0 | Alarm (trigger) |
+| bit 2 | Tamper          |
+
+## Architectural Notes
+
+* **Mains-powered devices → polling model as periodic loop (~60 seconds)**
+* **Sensors → event-driven model**
+  * Zigbee reporting
+  * IAS callbacks
+
+## Practical Notes
+The CSV structure is designed to be easily imported into:
+  * pandas
+  * Excel
+  * time-series systems (after transformation)
+* Support time-series analysis
+* Remain vendor-agnostic across Zigbee devices
 
 ## Zigbee Internals (Deep Dive)
 
@@ -226,18 +317,14 @@ measurements/YYYY-MM-DD/
 1. Device joins the network
 2. `device_initialized` is triggered
 3. Configuration phase:
-
    * binding
    * reporting setup
    * IAS enrollment
 4. Runtime:
-
    * polling for mains devices
    * event callbacks for sensors
 
----
-
-### Electrical Measurement
+### Electrical Measurement(#electric_measurement)
 
 Cluster:
 
