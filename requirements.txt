@@ -1,0 +1,4 @@
+bellows>=0.37.0
+zigpy>=0.61.0
+aioconsole>=0.6.0
+pyserial>=3.5
