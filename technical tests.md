@@ -1,6 +1,6 @@
-## **Technical limitations of device presence detection in Zigbee networks **
+## **Technical limitations of device presence detection in Zigbee networks**
 
-This document supplements the `zigbee_manager.py` implementation by explaining why an instant `device_left` event is not generated when a device goes offline and why entries sometimes persist in the device list.
+This file supplements the `zigbee_manager.py` implementation by explaining why an instant `device_left` event is not generated when a device goes offline and why entries sometimes persist in the device list.
 
 #### 1. General principle: sleepy End Devices and parent timeouts
 
