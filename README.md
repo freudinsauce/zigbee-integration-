@@ -1,4 +1,4 @@
-# Zigbee Energy Manager
+# Zigbee Devices Manager
 
 An asynchronous Zigbee network manager for monitoring and controlling Zigbee devices with a focus on energy telemetry, device state tracking, and event-driven processing. Zigbee Energy Manager is an event-driven system for managing a Zigbee network. It provides:
 
