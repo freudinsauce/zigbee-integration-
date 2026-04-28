@@ -43,15 +43,6 @@ Depending on network settings, this detection can take from tens of seconds up t
 - The current CSV logging and FIFO command architecture already provide a solid basis for such extensions without library changes.
 - The observed limitations are **inherent to the Zigbee protocol** and cannot be circumvented by switching to another EZSP‑based library.
 
-#### 7. Related code references
-
-- Device list → `zigbee_manager.py` → `ZigbeeEnergyManager.list_devices`
-- `device_left` implementation → `zigbee_manager.py` → `ZigbeeListener.device_left`
-- Last IAS state storage → `zigbee_manager.py` → `IASZoneListener.cluster_command`
-- Status command logic → `zigbee_manager.py` → `ZigbeeEnergyManager.get_device_status`
-
-
-
 ## **Memory usage**  
 The script was monitored for over 6 hours using:
 
