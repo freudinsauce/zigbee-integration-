@@ -1,421 +1,332 @@
-# Zigbee Devices Manager
+# SkF ADCS v3
 
-An asynchronous Zigbee network manager for monitoring and controlling Zigbee devices with a focus on energy telemetry, device state tracking, and event-driven processing. Zigbee Energy Manager is an event-driven system for managing a Zigbee network. It provides:
+Модель системы ориентации и стабилизации кубсата Skoltech-F: гашение угловой
+скорости, ориентация на Землю магнитными катушками, динамический
+мультипликативный фильтр Калмана (MEKF) и исследования его согласованности.
 
-* Device control (switching smart plugs)
-* Energy telemetry collection (voltage, current, power, energy)
-* Sensor monitoring (motion, contact, smoke)
-* Persistent logging to log file and CSV
-* Inter-process communication via FIFO
+Выполнение скриптов без использования зависимостей от Aerospace Toolbox и
+Statistics Toolbox. Пути подключаются из самого скрипта, `cd` в его
+папку не нужен.
 
-Built on top of `zigpy` and `bellows`, designed for use with a Zigbee coordinator (Silicon Labs EZSP -- JetStick Z4) on Linux systems such as Raspberry Pi.
+## Быстрый старт
 
-## Table of Contents
+| Точка входа | Что делает | Входы | Выходы |
+|---|---|---|---|
+| `EarthPointing_MTQ/EarthPointingMTQ.m` | ориентация на Землю, Монте-Карло | структура `opt` и `cfg` в начале скрипта | `res` в рабочей области, графики, сводка в консоли |
+| `BDot/Detumbling.m` | гашение угловой скорости | `ctrl.law` в `ctrlParams` | `results`, графики |
+| `studies/filterStudy.m` | статистика фильтра, лестницы, калибровка | пары имя-значение | структура `st`, файл в `studies/results` |
+| `studies/runKeyConfigs.m` | ключевые конфигурации большим ансамблем | `N`, `Configs`, `Extra`, `Suffix` | файлы в `studies/results/key_N<N>` |
+| `studies/plotFilterStudy.m` | графики одного результата `filterStudy` | `st` | окно с восемью вкладками, сводка в консоли |
+| `studies/fieldModelStudy.m` | модели поля вдоль орбиты, истинный аэромомент | имя конфигурации, пары имя-значение | `res`, файл `results/field_<имя>.mat` |
+| `studies/pointingBudget.m` | точность наведения против смещения центра масс | `Offsets`, `Rho`, `Runs`, `Orbits` | `bud` |
+| `tests/runAllTests.m` | юнит-тесты | нет | отчет в консоли |
 
-* [Zigbee Architecture](#zigbee-architecture)
-* [Supported Devices](#supported-devices)
-* [Features](#features)
-* [Project Structure](#project-structure)
-* [Installation](#installation)
-* [Configuration](#configuration)
-* [Running](#running)
-* [FIFO Command Interface](#fifo-command-interface)
-* [Data Logging](#data-logging)
-* [Zigbee Internals (Deep Dive)](#zigbee-internals-deep-dive)
-* [Troubleshooting](#troubleshooting)
-* [Testing Setup (~/.bashrc)](#testing-setup-bashrc)
+## Ориентация на Землю: EarthPointingMTQ
 
+Все настройки прогона собраны в начале скрипта. Аппарат, приборы, среда,
+регулятор и фильтр берутся из `config/`, скрипт их только переключает.
 
-## Zigbee Architecture
+```matlab
+%% параметры прогона
+% ступень лестницы для истины: 11 - полная модель, все источники
+opt.level = 11;
+% 'paired' - фильтр той же ступени, 'truth' - фильтр ступени level-1
+opt.mode = 'paired';
+% 'ladder' - модель фильтра ступени 11 paired: точный экспонент, матрица
+% перехода по двум участкам цикла, якобиан гироскопа для средней скорости,
+% запасы сняты, шум модели opt.modelNoiseTrq, детектор расходимости
+% взводится через 600 с; 'legacy' - прежняя модель (конфигурация A2)
+opt.filterModel = 'ladder';
+opt.modelNoiseTrq = 1e-12; % [Н·м] шум модели, подобран на ступени 1
+% возмущающие моменты в истине. false обнуляет амплитуду, поток случайных
+% чисел при этом не сдвигается
+opt.dist.aero = true; % аэродинамический момент
+opt.dist.srp = true; % давление солнечного света
+opt.dist.white = true; % белый остаток неучтенного момента
+% true - выключенный момент убирается и из sigma_trq фильтра (фильтр знает,
+% что момента нет); false - фильтр по-прежнему ждет номинальный момент
+opt.distInFilter = true;
+% остаточный диполь и собственное смещение магнитометра разыгрываются для
+% каждого прогона: смещение с СКО начальной ковариации фильтра, диполь с
+% СКО opt.mres0. false - общие значения из satParams
+opt.priorDraw = true;
+opt.mres0 = 1e-4; % [А·м^2] СКО остаточного диполя по оси
+% true - прежние масштабы приборов (sat.calLegacy) вместо принятых
+% остатков калибровки (sat.calAccepted)
+opt.legacyCal = false;
+opt.logRuns = 3; % для скольких прогонов писать поканальные журналы
+opt.plotRun = 1; % какой прогон показывать в plotRunChannels
 
-The system follows the standard Zigbee topology:
-
-* Coordinator — USB Zigbee dongle (EZSP / Silicon Labs)
-* Routers — mains-powered devices (e.g., smart plugs)
-* End Devices — battery-powered sensors
-
-Stack components:
-
-* `zigpy` — Zigbee abstraction layer
-* `bellows` — EZSP (Silicon Labs) radio implementation
-
-## Supported Devices
-
-### Mains-powered (Routers)
-
-* Smart plugs
-* Energy monitoring devices
-
-Clusters:
-
-* OnOff
-* ElectricalMeasurement
-* Metering
-
-### Battery-powered (End Devices)
-
-* Motion sensors (PIR)
-* Door/contact sensors
-* Smoke detectors
-
-Clusters:
-
-* IAS Zone
-* PowerConfiguration
-* TemperatureMeasurement
-* RelativeHumidity
-
-## Features
-
-### Core
-
-* Fully asynchronous architecture (asyncio)
-* Automatic device configuration on join
-* State restoration after restart
-
-### Monitoring
-
-* Periodic polling for mains devices
-* Event-driven handling for sensors
-* Battery level tracking
-
-### Data Handling
-
-* CSV logging:
-
-  * energy data
-  * temperature
-  * humidity
-  * binary sensor events
-
-### Control
-
-* FIFO-based command interface
-* Network control (permit join)
-* Device control
-
----
-
-## Project Structure
-
-```
-.
-├── zigbee_manager.py
-├── logs/
-│   └── zigbee_manager.log
-├── measurements/
-│   └── YYYY-MM-DD/
-│       ├── smart_plug.csv
-│       ├── temperature.csv
-│       ├── humidity.csv
-│       └── binary_sensors.csv
+cfg.omega0_sigma = deg2rad(0.5); % [рад/с] СКО начальной угловой скорости
+cfg.nRuns = 20;
+cfg.seed = 1;
+% длительность - четыре витка (cfg.simulationTime = 4*orb.period)
 ```
 
----
-
-## Installation
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-
-pip install zigpy bellows
-```
-
----
-
-## Configuration
-
-Main configuration:
-
-```python
-DEVICE_CONFIG = {
-    "database": "zigbee.db",
-    "device": {
-        "path": "/dev/serial/by-id/...",
-        "baudrate": 115200,
-    }
-}
-```
-
-Make sure the device path points to your Zigbee coordinator.
-
----
-
-## Running
-
-```bash
-LOG_LEVEL=INFO python zigbee_manager.py
-```
-
-On startup:
-
-* Zigbee network is initialized
-* Permit join is enabled for 60 seconds
-* Background tasks are started
-
----
-
-## FIFO Command Interface
-
-IPC is implemented using named pipes:
-
-```
-/tmp/zigbee_cmd
-/tmp/zigbee_resp
-```
-
-### Examples
-
-```bash
-echo "list" > /tmp/zigbee_cmd
-cat /tmp/zigbee_resp
-```
-
-```bash
-echo "permit 60" > /tmp/zigbee_cmd
-```
-
-```bash
-echo "toggle <ieee>" > /tmp/zigbee_cmd
-```
-
-```bash
-echo "status <ieee>" > /tmp/zigbee_cmd
-```
-
----
-
-## Data Logging
-
-All data is stored under:
-
-```
-measurements/YYYY-MM-DD/
-```
-
-## smart_plug.csv
-
-Logged in `_background_mains_monitor()` approximately every 60 seconds for mains-powered devices.
-
-| Column       | Type   | Unit     | Source/ZCL                     | Description                              |
-| ------------ | ------ | -------- | ------------------------------ | ---------------------------------------- |
-| timestamp    | string | ISO 8601 | System                         | Timestamp (`datetime.now().isoformat()`) |
-| ieee         | string | —        | Device                         | Device IEEE address                      |
-| manufacturer | string | —        | Basic cluster                  | Device manufacturer                      |
-| model        | string | —        | Basic cluster                  | Device model                             |
-| state        | string | ON/OFF   | OnOff (0x0006)                 | Current plug state                       |
-| voltage      | float  | V        | ElectricalMeasurement          | RMS voltage                              |
-| current      | float  | A        | ElectricalMeasurement          | RMS current                              |
-| power        | float  | W        | ElectricalMeasurement          | Active power                             |
-| energy_kwh   | float  | kWh      | Metering (0x0702)              | Accumulated energy                       |
-
-### Notes:
-
-* Values are scaled using:
-
-  * `multiplier`
-  * `divisor`
-* If a cluster is not available, the field may be missing (`None`)
-* `energy_kwh` is derived from `current_summ_delivered`
-
----
-
-## temperature.csv
-
-Logged in `attribute_updated()` on attribute change events.
-
-| Column        | Type   | Unit     | Source (Zigbee)                 | Description       |
-| ------------- | ------ | -------- | ------------------------------- | ----------------- |
-| timestamp     | string | ISO 8601 | System                          | Event timestamp   |
-| ieee          | string | —        | Device                          | Device IEEE       |
-| model         | string | —        | Device                          | Device model      |
-| temperature_c | float  | °C       | TemperatureMeasurement (0x0402) | Temperature value |
-
-### Notes:
-
-* Raw value conversion:
-
-  * `temperature = value / 100`
-* Event-driven (no polling)
-
----
-
-## humidity.csv
-
-Same mechanism as temperature.
-
-| Column           | Type   | Unit     | Source (Zigbee)           | Description     |
-| ---------------- | ------ | -------- | ------------------------- | --------------- |
-| timestamp        | string | ISO 8601 | System                    | Event timestamp |
-| ieee             | string | —        | Device                    | Device IEEE     |
-| model            | string | —        | Device                    | Device model    |
-| humidity_percent | float  | %        | RelativeHumidity (0x0405) | Humidity value  |
-
-### Notes:
-* Conversion:
-  * `humidity = value / 100`
-* Typically uses Zigbee reporting
-
-## binary_sensors.csv
-
-Logged in `IASZoneListener.cluster_command()`.
-
-| Column       | Type   | Unit     | Source (Zigbee)             | Description            |
-| ------------ | ------ | -------- | --------------------------- | ---------------------- |
-| timestamp    | string | ISO 8601 | System                      | Event timestamp        |
-| ieee         | string | —        | Device                      | Device IEEE            |
-| manufacturer | string | —        | Basic cluster               | Manufacturer           |
-| model        | string | —        | Basic cluster               | Model                  |
-| sensor_type  | string | —        | Derived                     | Sensor classification  |
-| state        | int    | 0/1      | IAS Zone (0x0500)           | Triggered state        |
-| tamper       | int    | 0/1      | IAS Zone                    | Tamper flag            |
-| battery      | int/"" | %        | PowerConfiguration (0x0001) | Battery level          |
-| lqi          | int/"" | —        | Device                      | Link Quality Indicator |
-
----
-
-### Sensor Type Logic
-
-| Condition (model string)     | Type    |
-| ---------------------------- | ------- |
-| contains "PIR" or "Motion"   | motion  |
-| contains "Smoke" or "TS0205" | smoke   |
-| otherwise                    | contact |
-
-
-### IAS Zone Bit-Level Mapping
-
-| Bit   | Meaning         |
-| ----- | --------------- |
-| bit 0 | Alarm (trigger) |
-| bit 2 | Tamper          |
-
-## Architectural Notes
-
-* **Mains-powered devices → polling model as periodic loop (~60 seconds)**
-* **Sensors → event-driven model**
-  * Zigbee reporting
-  * IAS callbacks
-
-## Practical Notes
-The CSV structure is designed to be easily imported into:
-  * pandas
-  * Excel
-  * time-series systems (after transformation)
-* Support time-series analysis
-* Remain vendor-agnostic across Zigbee devices
-
-## Zigbee Internals (Deep Dive)
-
-### Device Lifecycle
-
-1. Device joins the network
-2. `device_initialized` is triggered
-3. Configuration phase:
-   * binding
-   * reporting setup
-   * IAS enrollment
-4. Runtime:
-   * polling for mains devices
-   * event callbacks for sensors
-
-### Electrical Measurement(#electric_measurement)
-
-Cluster:
-
-```
-ElectricalMeasurement (0x0B04)
-```
-
-Raw values are scaled using:
-
-* multiplier
-* divisor
-
----
-
-### Metering (Energy)
-
-Cluster:
-
-```
-Metering (0x0702)
-```
-
-Attribute:
-
-* `current_summ_delivered`
-
-Converted to kWh using:
-
-* multiplier
-* divisor
-
----
-
-### IAS Zone (Security Sensors)
-
-Handled via:
-
-```
-ZoneStatusChangeNotification
-```
-
-Bit flags:
-
-* bit 0 → alarm
-* bit 2 → tamper
-
----
-
-### Battery Model
-
-Voltage:
-
-```
-V = raw / 10
-```
-
-Estimated percentage:
-
-```
-(V - 2.4) / 0.6 * 100
-```
-
-This is a simplified linear approximation.
-
-## Troubleshooting
-### Logs are delayed or not visible
-* Running in a non-interactive environment
-* Output buffering
-### Device does not respond
-* Device may be sleeping (battery-powered)
-* Reporting may not be configured
-### Cluster read errors
-* Some devices do not fully comply with Zigbee specifications
-
-## Testing Setup (~/.bashrc)
-
-For easier testing, add the following aliases to your `~/.bashrc`:
-
-```bash
-alias zb-list='echo "list" > /tmp/zigbee_cmd && cat /tmp/zigbee_resp'
-alias zb-permit='echo "permit 60" > /tmp/zigbee_cmd'
-alias zb-toggle='echo "toggle $1" > /tmp/zigbee_cmd'
-alias zb-status='echo "status $1" > /tmp/zigbee_cmd'
-```
-
-Apply changes:
-
-```bash
-source ~/.bashrc
-```
-
-Usage:
-
-```bash
-zb-list
-zb-status <ieee>
-zb-toggle <ieee>
-```
+Регулятор всегда работает по оценке фильтра. Регулятор по истине - прием
+изучения фильтра в `filterStudy`, а не режим полета.
+
+Типичные варианты:
+
+    без моментов вообще        opt.dist.aero = false; opt.dist.srp = false; opt.dist.white = false;
+    без аэродинамики           opt.dist.aero = false;
+    момент есть, фильтр не знает   opt.dist.aero = false; opt.distInFilter = false;
+    прежний фильтр             opt.filterModel = 'legacy'; opt.priorDraw = false;
+
+**Выходы.**
+
+- В консоли: конфигурация прогона и итоговая `sigma_trq` фильтра, затем
+  сводка `plotEarthPointing` по последней четверти интервала: ошибка знания
+  и ошибка наведения (медиана, 95 %, максимум), ошибка наведения по
+  прогонам в конце, средний NIS/n, полоса контура и максимальный момент
+  регулятора.
+- `plotEarthPointing`: ансамблевые графики ошибки знания (истина против
+  оценки, качество фильтра) и ошибки наведения (истина против опорной
+  ориентации, качество всей системы).
+- `plotRunChannels(res, opt.plotRun)`: один прогон на вкладках
+  магнитометр, кватернион, гироскоп, управление и возмущения, внешнее поле.
+  Номер прогона не больше `opt.logRuns`.
+- Структура `res` (основные поля, время по строкам, прогоны по последнему
+  измерению):
+
+        res.t           время цикла, с
+        res.qTrue       истинный кватернион ОСК -> ССК
+        res.qEst        оценка фильтра
+        res.attErr      ошибка знания ориентации, рад
+        res.ape         ошибка наведения, рад
+        res.attSigma    сигма ориентации из P фильтра
+        res.nis         нормированная невязка
+        res.nMeas       число измерений на шаге (9 на свету, 6 в тени)
+        res.eclipse     признак тени
+        res.mCtrl       дипольный момент катушек
+        res.trqDist     возмущающий момент в истине
+        res.diverged    прогоны с расходимостью фильтра
+        res.divTime     время расходимости
+
+  Поканальные журналы (`res.Bmeas`, `res.Bcorr`, `res.BextEst`,
+  `res.BextTrue`, `res.wMeas`, `res.wEst`, `res.bGyro`, `res.qTriad` и
+  другие) пишутся для первых `opt.logRuns` прогонов.
+
+## Изучение фильтра: filterStudy
+
+    st = filterStudy('имя', значение, ...);
+    plotFilterStudy(st);
+
+Основные параметры:
+
+| Параметр | По умолчанию | Смысл |
+|---|---|---|
+| `Runs` | 50 | число реализаций Монте-Карло |
+| `Duration` | 4 витка | длительность прогона, с |
+| `Seed` | 1 | зерно |
+| `Save`, `Plot` | true | сохранять результат, строить графики сразу |
+| `QScale`, `RScale` | 1 | множители шумов фильтра (только фильтра) |
+| `Disable` | {} | выключить источники в истине и фильтре: `mtmScale`, `gyroScale`, `mtmQuant`, `gyroQuant`, `mRes`, `ssSys`, `ssEdge`, `ssAlbedo`, `thermal`, `bExt`, `srp`, `aero`, `dist` |
+
+Лестница усложнения (`config/ladderLevelDyn.m`):
+
+| Параметр | По умолчанию | Смысл |
+|---|---|---|
+| `Level` | [] | ступень 0-11; пусто - прежний режим без лестницы |
+| `Mode` | `'paired'` | `'paired'` - фильтр той же ступени, `'truth'` - ступени L-1 |
+| `ModelNoiseTrq` | 0 | шум модели, Н·м (на лестнице принят 1e-12) |
+| `Margins` | [] | запасы фильтра; на лестнице сняты |
+| `TruthControl` | [] | регулятор по истине; на лестнице да |
+| `PhiExact`, `ModelFix` | [] | точный экспонент; два участка цикла и якобиан средней скорости; на лестнице да |
+| `DivArm` | [] | взвод детектора расходимости, с; на лестнице 600 |
+| `LadderMres0` | 1e-4 | СКО остаточного диполя истины и начальной ковариации, А·м² |
+
+Ступени: 0 без шумов; 1 белые шумы приборов, блуждание смещения гироскопа,
+начальный ZRO; 2 тень; 3 смещение магнитометра; 4 перекос солнечных
+датчиков; 5 термодрейф ZRO; 6 внешнее поле; 7 масштабы, неортогональность,
+квант; 8 краевая ошибка и альбедо; 9 остаточный диполь; 10 давление света и
+белый остаток момента; 11 аэродинамика.
+
+Старая лестница и чувствительность:
+
+| Параметр | По умолчанию | Смысл |
+|---|---|---|
+| `EstimateBext` | [] | `false` - внешнее поле не состоянием (вариант B2) |
+| `BextInR`, `BmRw`, `TrqFloor`, `IsoSunR` | см. код | переключатели прежних конфигураций st0-st9 |
+| `BextInDynamics` | [] | внешнее поле в прогнозе динамики (правка m x B_ext) |
+| `Scale` | {} | множители амплитуд: `bExt`, `bExtTau`, `aero`, `gyroScale`, `mtmScale`, `thermal` |
+| `ScaleMode` | `'paired'` | `'truth'` - множитель только в истине |
+
+Остатки калибровки:
+
+| Параметр | По умолчанию | Смысл |
+|---|---|---|
+| `LegacyCal` | true | прежние масштабы приборов, чтобы результаты отчета воспроизводились |
+| `Cal` | {} | абсолютные СКО остатка калибровки: `gyroScale`, `gyroCross`, `mtmScale`, `mtmCross`; масштаб - число или вектор 3x1, перекрестные члены - число или матрица 3x3; `'accepted'` - принятые значения из `satParams` |
+| `CalName` | '' | короткое имя варианта для файла |
+
+**Выходы.** Структура `st` и файл
+`studies/results/filter_<тег>.mat` с той же структурой. Тег собирается из
+ступени и режима (`L9_paired_N50`) или множителей Q и R, выключенных
+источников и меток варианта (`mnt1e-12`, `bextDyn`, `cal_<имя>` и т.д.).
+Основные поля `st`:
+
+    st.nees, st.neesMed      средний и медианный NEES по прогонам во времени
+    st.neesTail, st.neesTailMed  то же на хвосте (последняя четверть прогона)
+    st.neesDof, st.neesBounds    число степеней свободы и границы 95 %
+    st.nis, st.nisTail, st.nisAll  NIS: среднее во времени, на хвосте, по прогонам
+    st.groups               по группам состояний: rms, sigma, ratio во
+                            времени, rmsTail, sigmaTail, errRun1, sigRun1
+    st.nuStd, st.nuMean, st.nuAcf  нормированная невязка по каналам на хвосте
+    st.attErrDeg, st.attSigmaDeg, st.apeDeg  по прогонам во времени
+    st.diverged, st.divTimeMin   расходимости
+    st.level, st.mode, st.variant, st.cal  описание конфигурации
+
+`plotStatesRun1(st, имя)` рисует состояния первого прогона отдельно.
+`mergeFilterStudy(parts)` сливает результаты одной конфигурации с разными
+зернами.
+
+## Ключевые конфигурации: runKeyConfigs
+
+    runKeyConfigs('N', 100, 'Configs', {'C4'}, 'Extra', {...}, 'Suffix', '_имя');
+
+Конфигурации: `st0`-`st9` (старая лестница), `B2`, `A2`, `C1`-`C5`. Расчет
+идет порциями по `ChunkSize` (по умолчанию 100) реализаций с зернами 1, 2,
+...; готовые порции при повторном запуске пропускаются, поэтому для
+пересчета нужен новый `Suffix`. В `Suffix` не должно быть точек: из него
+строится имя переменной. Результат:
+`studies/results/key_N<N>/<имя><Suffix>_N<N>.mat`, переменная с тем же
+именем.
+
+## Прочие исследования
+
+| Функция | Входы | Выходы |
+|---|---|---|
+| `plotLadderFigures` | `N` (100 или 20), `Configs1`, `Configs4`, `TableConfigs`, `Save` | рисунки лестниц, сводная таблица (возвращается и пишется в csv) |
+| `verifyLegacyLadder(keys)` | список конфигураций st0-st9 | сравнение с эталоном `filterStudy_results_st0_st9.mat` |
+| `filterTuningSweep` | `QScales`, `RScales`, `Runs`, `Duration` | карта ошибки и NEES по множителям Q и R |
+| `pointingBudget` | `Offsets`, `Rho`, `Runs`, `Orbits` | `bud.trq`, `bud.apeMed`, `bud.apeP95`, `bud.knowMed` по смещениям центра масс |
+| `fieldModelStudy(имя)` | `igrf_j2`, `igrf_kepler`, `dipole_j2`, `dipole_kepler`, `dipoleOrb`; `Duration`, `Step`, `Torque`, `AttOffsetDeg` | `res.Btruth`, `res.Bmodel`, `res.angErr`, `res.stats`; с `'Torque', true` - `res.trq` (аэромомент при точной ориентации и с отклонением) |
+| `plotFieldModel(res)` | `XAxis`, `Orbits`, `Export` | модуль поля, компоненты в ОСК, аэромомент (если считался) |
+| `overlayFieldModels(names)` | список конфигураций | наложение ошибок моделей поля |
+
+Истинный аэромомент на четырех витках:
+
+    res = fieldModelStudy('igrf_j2', 'Duration', 22648, 'Step', 10, 'Torque', true);
+    plotFieldModel(res, 'Export', true);   % studies/results/aero_torque_igrf_j2.png
+
+## Где что лежит
+
+    common/      единственный экземпляр каждой функции
+    config/      параметры: аппарат и приборы (satParams), орбита
+                 (orbitParams), среда (envParams), цикл и регулятор
+                 (ctrlParams), фильтр (ekfParams), лестница (ladderLevelDyn)
+    EarthPointing_MTQ/  ориентация на Землю: точка входа, цикл, графики
+    BDot/        гашение угловой скорости
+    studies/     исследования; результаты в studies/results
+    tests/       юнит-тесты, каждый закрывает конкретный дефект
+    c_reference/ опорная реализация IGRF на C для STM32
+
+`rhsRotationalDynamics`, `simEarthPointing` и `kalmanFilter` существуют по
+одной версии; различия между режимами задаются параметрами.
+
+## Остатки калибровки приборов
+
+В `config/satParams.m` два набора масштабов и неортогональности:
+
+| | Принятые (`sat.calAccepted`) | Прежние (`sat.calLegacy`) |
+|---|---|---|
+| масштаб гироскопа | 1e-3 | 5e-3 (паспорт) |
+| перекрестные члены гироскопа | 1e-3 | 1.25e-2 (паспорт) |
+| масштаб магнитометра | 1e-4 | 5e-4 |
+| неортогональность магнитометра | 5e-5 | 0 |
+
+Принятые значения получены сеткой `filterStudy('Cal', ...)` на ступени 9 и
+стоят по умолчанию в модели (`EarthPointingMTQ`, `Detumbling`); остаток
+описан и в истине, и в R фильтра. `filterStudy` по умолчанию берет прежние
+(`'LegacyCal'`). Значения для магнитометра - требования к калибровке, а не
+достигнутая точность.
+
+## Воспроизводимость
+
+Контрольные значения для проверки после изменений кода:
+
+    filterStudy('Level', 7, 'Mode', 'paired', 'Runs', 50, 'ModelNoiseTrq', 1e-12, 'BextInDynamics', true, 'Plot', false)
+        NEES на хвосте: среднее 65.75, медиана 49.93
+    runKeyConfigs('N', 100, 'Configs', {'C4'}, 'Suffix', '_check')
+        средний NEES на хвосте 26.043, медиана 20.1
+
+Источник выключается обнулением амплитуды, а не пропуском вызова, поэтому
+поток случайных чисел не зависит от ступени и выключателей.
+
+## Разделение истины и борта
+
+| что | истина (симулятор) | борт (фильтр и регулятор) |
+|---|---|---|
+| геомагнитное поле | `env.truthModel`, истинная ОСК | `env.onboardModel`, бортовая ОСК |
+| время | `t` | `onboardClock(t, env)` |
+| орбита | `orb.propagator` | `env.onboardModel.propagator` |
+| параметры приборов | `config/satParams.m` | `config/ekfParams.m` |
+| остаточный диполь | `sat.mRes` | состояние фильтра 17..19 |
+
+В фильтр не попадает ни одна величина, посчитанная по истинному кватерниону
+или по истинной орбитальной системе. Это условие того, что бортовой код на
+C сможет повторить те же числа.
+
+## Вектор состояния фильтра
+
+    1:4    кватернион ОСК -> ССК
+    5:7    абсолютная угловая скорость, ССК
+    8:10   смещение магнитометра
+    11:13  смещение гироскопа
+    14:16  перекос активного солнечного датчика (вектор малого поворота)
+    17:19  остаточный дипольный момент (ekf.estimateMres)
+    20:22  внешнее магнитное поле в ОСК (ekf.estimateBext)
+
+Вектор ошибки на единицу короче: кватернион входит в него тремя числами
+(малый поворот), всего до 21 состояния. Индексы в векторе ошибки: 1:3
+ориентация, 4:6 угловая скорость, 7:9 смещение магнитометра, 10:12 смещение
+гироскопа, 13:15 перекос солнечного датчика, 16:18 диполь, 19:21 внешнее
+поле.
+
+Перекос солнечных датчиков хранится банком: в состоянии живет перекос
+датчика, который сейчас видит Солнце, оценки остальных пяти лежат в `bank`
+и подгружаются при переключении.
+
+## Режим гашения
+
+Закон по умолчанию - B-dot, `m = -k*dB/dt` по двум последовательным
+измерениям магнитометра. Гироскоп он не использует, поэтому начальное
+смещение ZRO +-0.5 град/с на него не влияет. B-cross (`m = k*(omega x B)`)
+оставлен как опция `ctrl.law = 'bcross'` и гасит только до уровня этого
+смещения. Выход `simDetumbling`: `results.t`, `results.w`, `results.m`,
+`results.settled`, `results.tSettle`.
+
+## Модель геомагнитного поля
+
+`config/envParams.m` задает две модели независимо: `env.truthModel` (чем
+порождается настоящее поле) и `env.onboardModel` (что знает бортовой
+алгоритм). Тип `'dipoleOrb'` - исходная формула прямого диполя в
+орбитальной системе.
+
+## Возмущающие моменты
+
+Аэродинамика и давление света считаются панельной моделью корпуса 3U от
+фактической ориентации (`common/environment/disturbanceTorque.m`). У
+прямоугольного корпуса момент относительно геометрического центра равен
+нулю, поэтому все определяется смещением центра масс
+(`sat.geom.comOffset`). При номинальных значениях (плотность 1e-12 кг/м^3,
+смещение [0.5; 0.5; 1] см) аэромомент около 2.6e-8 Н·м и почти постоянен в
+ОСК; давление света около 2e-9 Н·м. Белым шумом задан только малый
+неучтенный остаток (`env.trqWhitePsd`).
+
+## Порядок работ дальше
+
+1. Ответить на вопросы, помеченные `TODO` в `config/`: остаточный
+   дипольный момент, смещение центра масс, матрицы установки приборов,
+   точность солнечных датчиков (+-5 град как 1 или 3 сигма), плотность
+   атмосферы на дату запуска.
+2. Калибровка магнитометра: масштаб не хуже 1.7e-4, неортогональность не
+   хуже 7e-5 на элемент, либо оценка перекоса магнитометра в полете.
+3. Переход на кинематический фильтр и повторение на нем лестницы
+   усложнения для ступеней 6, 8-11.
+4. Регулятор: при номинальном аэромоменте наведение около 20 град при
+   знании около 1.6 град, то есть ограничивает управление (нет интегральной
+   части против постоянного момента).
+5. Прошивка обязана усреднять отсчеты гироскопа за весь цикл: именно такому
+   усреднению соответствует шум в модели и матрица R фильтра.
